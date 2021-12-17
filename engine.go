@@ -9,8 +9,10 @@ package BigSmartORM
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"runtime"
+	"sync"
 
 	"strconv"
 	"strings"
@@ -35,6 +37,7 @@ type BigSmartEngine struct {
 	Tx           *sql.Tx
 	GroupParam   string
 	HavingParam  string
+	mu           sync.Mutex
 }
 
 //设置表名
@@ -110,7 +113,12 @@ func (bse *BigSmartEngine) insertData(data interface{}, insertType string) (int6
 
 	//prepare
 	var stmt *sql.Stmt
-	stmt, err := bse.Db.Prepare(bse.Prepare)
+	var err error
+	if bse.TransStatus == 1 {
+		stmt, err = bse.Tx.Prepare(bse.Prepare)
+	} else {
+		stmt, err = bse.Db.Prepare(bse.Prepare)
+	}
 	if err != nil {
 		return 0, bse.setErrorInfo(err)
 	}
@@ -209,7 +217,11 @@ func (bse *BigSmartEngine) batchInsertData(batchData interface{}, insertType str
 	//prepare
 	var stmt *sql.Stmt
 	var err error
-	stmt, err = bse.Db.Prepare(bse.Prepare)
+	if bse.TransStatus == 1 {
+		stmt, err = bse.Tx.Prepare(bse.Prepare)
+	} else {
+		stmt, err = bse.Db.Prepare(bse.Prepare)
+	}
 	if err != nil {
 		return 0, bse.setErrorInfo(err)
 	}
@@ -431,7 +443,11 @@ func (bse *BigSmartEngine) Delete() (int64, error) {
 	//第一步：Prepare
 	var stmt *sql.Stmt
 	var err error
-	stmt, err = bse.Db.Prepare(bse.Prepare)
+	if bse.TransStatus == 1 {
+		stmt, err = bse.Tx.Prepare(bse.Prepare)
+	} else {
+		stmt, err = bse.Db.Prepare(bse.Prepare)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -451,4 +467,564 @@ func (bse *BigSmartEngine) Delete() (int64, error) {
 	}
 
 	return rowsAffected, nil
+}
+
+func (bse *BigSmartEngine) Update(data ...interface{}) (int64, error) {
+	var dataType int
+	switch len(data) {
+	case 1, 2:
+		dataType = len(data)
+	default:
+		return 0, errors.New("参数个数错误")
+	}
+
+	switch dataType {
+	case 1:
+		t := reflect.TypeOf(data[0])
+		v := reflect.ValueOf(data[0])
+
+		var fieldNameArray []string
+		for i := 0; i < t.NumField(); i++ {
+			if !v.Field(i).CanInterface() {
+				continue
+			}
+
+			sqlTag := t.Field(i).Tag.Get("sql")
+			if sqlTag != "" {
+				fieldNameArray = append(fieldNameArray, fmt.Sprintf("%s=?", strings.Split(sqlTag, ",")[0]))
+			} else {
+				fieldNameArray = append(fieldNameArray, fmt.Sprintf("%s=?", t.Field(i).Name))
+			}
+
+			bse.UpdateExec = append(bse.UpdateExec, v.Field(i).Interface())
+		}
+		bse.UpdateParam += strings.Join(fieldNameArray, ",")
+
+	case 2:
+		bse.UpdateParam += data[0].(string) + "=?"
+		bse.UpdateExec = append(bse.UpdateExec, data[1])
+	}
+
+	bse.Prepare = "update" + bse.GetTable() + " set " + bse.UpdateParam
+
+	if bse.WhereParam != "" || bse.OrWhereParam != "" {
+		bse.Prepare += " where " + bse.WhereParam + bse.OrWhereParam
+	}
+
+	if bse.LimitParam != "" {
+		bse.Prepare += " limit " + bse.LimitParam
+	}
+
+	var stmt *sql.Stmt
+	var err error
+	if bse.TransStatus == 1 {
+		stmt, err = bse.Tx.Prepare(bse.Prepare)
+	} else {
+		stmt, err = bse.Db.Prepare(bse.Prepare)
+	}
+	if err != nil {
+		return 0, bse.setErrorInfo(err)
+	}
+
+	if bse.WhereExec != nil {
+		bse.AllExec = append(bse.AllExec, bse.WhereExec)
+	}
+
+	result, err := stmt.Exec(bse.AllExec)
+	if err != nil {
+		return 0, bse.setErrorInfo(err)
+	}
+
+	id, _ := result.RowsAffected()
+	return id, nil
+}
+
+func (bse *BigSmartEngine) Select() ([]map[string]string, error) {
+
+	bse.Prepare += "select * from " + bse.GetTable()
+
+	if bse.WhereParam != "" || bse.OrWhereParam != "" {
+		bse.Prepare += " where " + bse.WhereParam + bse.OrWhereParam
+	}
+
+	//group 不为空
+	if bse.GroupParam != "" {
+		bse.Prepare += " group by " + bse.GroupParam
+	}
+
+	//having
+	if bse.HavingParam != "" {
+		bse.Prepare += " having " + bse.HavingParam
+	}
+
+	bse.AllExec = append(bse.AllExec, bse.WhereExec)
+
+	var err error
+	var rows *sql.Rows
+	if bse.TransStatus == 1 {
+		rows, err = bse.Tx.Query(bse.Prepare, bse.AllExec)
+	} else {
+		rows, err = bse.Db.Query(bse.Prepare, bse.AllExec)
+	}
+	if err != nil {
+		return nil, bse.setErrorInfo(err)
+	}
+
+	colume, err := rows.Columns()
+	if err != nil {
+		return nil, bse.setErrorInfo(err)
+	}
+
+	values := make([][]byte, len(colume))
+	scans := make([]interface{}, len(colume))
+
+	for i := range values {
+		scans[i] = &values[i]
+	}
+
+	result := make([]map[string]string, 0)
+	for rows.Next() {
+		if err := rows.Scan(scans...); err != nil {
+			return nil, bse.setErrorInfo(err)
+		}
+
+		//row
+		row := make(map[string]string)
+		for k, v := range values {
+			row[colume[k]] = string(v)
+		}
+		result = append(result, row)
+	}
+
+	return result, nil
+}
+
+func (bse *BigSmartEngine) SelectOne() (map[string]string, error) {
+	//limit 1 单个查询
+	results, err := bse.Limit(1).Select()
+	if err != nil {
+		return nil, bse.setErrorInfo(err)
+	}
+
+	//判断是否为空
+	if len(results) == 0 {
+		return nil, nil
+	} else {
+		return results[0], nil
+	}
+}
+
+func (bse *BigSmartEngine) Find(data interface{}) error {
+	v := reflect.ValueOf(data)
+
+	if v.Kind() != reflect.Ptr {
+		return bse.setErrorInfo(errors.New("参数请传指针变量!"))
+	}
+
+	if v.IsNil() {
+		return bse.setErrorInfo(errors.New("参数不能是空指针!"))
+	}
+
+	bse.Prepare = "SELECT * FROM " + bse.GetTable()
+
+	bse.AllExec = bse.WhereExec
+
+	//group 不为空
+	if bse.GroupParam != "" {
+		bse.Prepare += " group by " + bse.GroupParam
+	}
+
+	//having
+	if bse.HavingParam != "" {
+		bse.Prepare += " having " + bse.HavingParam
+	}
+
+	var err error
+	var rows *sql.Rows
+	if bse.TransStatus == 1 {
+		rows, err = bse.Tx.Query(bse.Prepare, bse.AllExec)
+	} else {
+		rows, err = bse.Db.Query(bse.Prepare, bse.AllExec)
+	}
+	if err != nil {
+		return bse.setErrorInfo(err)
+	}
+
+	column, err := rows.Columns()
+	if err != nil {
+		return bse.setErrorInfo(err)
+	}
+
+	values := make([][]byte, len(column))
+	scans := make([]interface{}, len(column))
+
+	destSlice := v.Elem()
+
+	destType := v.Type().Elem()
+
+	for i := range scans {
+		scans[i] = &values[i]
+	}
+
+	for rows.Next() {
+		dest := reflect.New(destType).Elem()
+
+		if err := rows.Scan(scans...); err != nil {
+			return bse.setErrorInfo(err)
+		}
+
+		for k, v := range values {
+			key := column[k]
+			value := string(v)
+
+			//遍历结构体
+			for i := 0; i < destType.NumField(); i++ {
+				sqlTag := destType.Field(i).Tag.Get("sql")
+				var filedName string
+				if sqlTag != "" {
+					filedName = strings.Split(sqlTag, ",")[0]
+				} else {
+					filedName = destType.Field(i).Name
+				}
+				if key != filedName {
+					continue
+				}
+
+				if err := bse.reflectSet(dest, i, value); err != nil {
+					return err
+				}
+			}
+
+		}
+		destSlice.Set(reflect.AppendSlice(destSlice, dest))
+	}
+	return nil
+}
+
+//反射赋值
+func (e *BigSmartEngine) reflectSet(dest reflect.Value, i int, value string) error {
+	switch dest.Field(i).Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		res, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return e.setErrorInfo(err)
+		}
+		dest.Field(i).SetInt(res)
+	case reflect.String:
+		dest.Field(i).SetString(value)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		res, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return e.setErrorInfo(err)
+		}
+		dest.Field(i).SetUint(res)
+	case reflect.Float32:
+		res, err := strconv.ParseFloat(value, 32)
+		if err != nil {
+			return e.setErrorInfo(err)
+		}
+		dest.Field(i).SetFloat(res)
+	case reflect.Float64:
+		res, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return e.setErrorInfo(err)
+		}
+		dest.Field(i).SetFloat(res)
+	case reflect.Bool:
+		res, err := strconv.ParseBool(value)
+		if err != nil {
+			return e.setErrorInfo(err)
+		}
+		dest.Field(i).SetBool(res)
+	}
+	return nil
+}
+
+func (bse *BigSmartEngine) FindOne(data interface{}) error {
+	dest := reflect.Indirect(reflect.ValueOf(data))
+
+	//生成数据容器
+	destSlice := reflect.New(reflect.SliceOf(dest.Type())).Elem()
+
+	if err := bse.Limit(1).Find(destSlice.Addr().Interface()); err != nil {
+		return err
+	}
+
+	if destSlice.Len() == 0 {
+		return bse.setErrorInfo(errors.New("NOT FOUND"))
+	}
+
+	dest.Set(destSlice.Index(0))
+	return nil
+}
+
+//limit分页
+func (bse *BigSmartEngine) Limit(limit ...int64) *BigSmartEngine {
+	if len(limit) == 1 {
+		bse.LimitParam = strconv.Itoa(int(limit[0]))
+	} else if len(limit) == 2 {
+		bse.LimitParam = strconv.Itoa(int(limit[0])) + "," + strconv.Itoa(int(limit[1]))
+	} else {
+		panic("参数个数错误")
+	}
+	return bse
+}
+
+//设置查询字段Field
+func (bse *BigSmartEngine) Field(field ...string) *BigSmartEngine {
+	bse.FieldParam = strings.Join(field, ",")
+
+	return bse
+}
+
+func (bse *BigSmartEngine) aggregateQuery(name, param string) (interface{}, error) {
+	bse.Prepare = " select " + name + "(" + param + ") as cnt from" + bse.GetTable()
+
+	if bse.WhereParam != "" || bse.OrWhereParam != "" {
+		bse.Prepare += bse.WhereParam + bse.OrWhereParam
+	}
+
+	if bse.LimitParam != "" {
+		bse.Prepare += " limit " + bse.LimitParam
+	}
+
+	bse.AllExec = bse.WhereExec
+
+	bse.generateSql()
+
+	var cnt interface{}
+
+	if err := bse.Db.QueryRow(bse.Prepare, bse.AllExec).Scan(cnt); err != nil {
+		return nil, err
+	}
+	return cnt, nil
+}
+
+func (bse *BigSmartEngine) generateSql() {
+	bse.Sql = bse.Prepare
+	for _, v := range bse.AllExec {
+		switch v.(type) {
+		case int:
+			bse.Sql = strings.Replace(bse.Sql, "?", strconv.Itoa(v.(int)), 1)
+		case int64:
+			bse.Sql = strings.Replace(bse.Sql, "?", strconv.FormatInt(v.(int64), 10), 1)
+		case bool:
+			bse.Sql = strings.Replace(bse.Sql, "?", strconv.FormatBool(v.(bool)), 1)
+		default:
+			bse.Sql = strings.Replace(bse.Sql, "?", fmt.Sprintf(" '%s'", v.(string)), 1)
+		}
+	}
+}
+
+func (bse *BigSmartEngine) Max(param string) (string, error) {
+	max, err := bse.aggregateQuery("max", param)
+	if err != nil {
+		return "0", err
+	}
+	return string(max.([]byte)), nil
+}
+
+func (bse *BigSmartEngine) Min(param string) (string, error) {
+	min, err := bse.aggregateQuery("min", param)
+	if err != nil {
+		return "0", err
+	}
+	return string(min.([]byte)), nil
+}
+
+func (bse *BigSmartEngine) Avg(param string) (string, error) {
+	avg, err := bse.aggregateQuery("avg", param)
+	if err != nil {
+		return "0", err
+	}
+	return string(avg.([]byte)), nil
+}
+
+func (bse *BigSmartEngine) Sum(param string) (string, error) {
+	sum, err := bse.aggregateQuery("sum", param)
+	if err != nil {
+		return "0", err
+	}
+	return string(sum.([]byte)), nil
+}
+
+func (bse *BigSmartEngine) Count(param string) (string, error) {
+	count, err := bse.aggregateQuery("count", param)
+	if err != nil {
+		return "0", err
+	}
+	return string(count.([]byte)), nil
+}
+
+func (bse *BigSmartEngine) Order(data ...string) *BigSmartEngine {
+	if len(data)%2 != 0 {
+		panic("order by参数错误，请保证个数为偶数个")
+	}
+
+	orderNum := len(data) / 2
+
+	if bse.OrderParam != "" {
+		bse.OrderParam += ","
+	}
+
+	for i := 0; i < orderNum; i++ {
+		key := strings.ToLower(data[i*2+1])
+		if key != "desc" && key != "asc" {
+			panic("排序关键字为：desc和asc")
+		}
+		if i < orderNum-1 {
+			bse.OrderParam += fmt.Sprintf("%s %s,", data[i*2], data[i*2+1])
+		} else {
+			bse.OrderParam += fmt.Sprintf("%s %s", data[i*2], data[i*2+1])
+		}
+	}
+
+	return bse
+}
+
+func (bse *BigSmartEngine) Group(group ...string) *BigSmartEngine {
+	if len(group) != 0 {
+		bse.GroupParam = strings.Join(group, ",")
+	}
+	return bse
+}
+
+func (bse *BigSmartEngine) Having(having ...interface{}) *BigSmartEngine {
+	var dataType int
+	switch len(having) {
+	case 1, 2, 3:
+		dataType = len(having)
+	default:
+		panic("having个数错误")
+	}
+
+	if bse.HavingParam != "" {
+		bse.HavingParam += "and ("
+	} else {
+		bse.HavingParam += "("
+	}
+
+	switch dataType {
+	case 1: //结构体
+		t := reflect.TypeOf(having[0])
+		v := reflect.ValueOf(having[0])
+
+		var fieldName []string
+		for i := 0; i < t.NumField(); i++ {
+			if !v.Field(i).CanInterface() {
+				continue
+			}
+
+			sqlTag := t.Field(i).Tag.Get("sql")
+			if sqlTag != "" {
+				fieldName = append(fieldName, strings.Split(sqlTag, ",")[0]+"=?")
+			} else {
+				fieldName = append(fieldName, t.Field(i).Name+"=?")
+			}
+			bse.WhereExec = append(bse.WhereExec, v.Field(i).Interface())
+		}
+		bse.HavingParam += strings.Join(fieldName, "and") + ")"
+	case 2: // =
+		bse.HavingParam += having[0].(string) + "=?)"
+		bse.WhereExec = append(bse.WhereExec, having[1])
+	case 3: // > >= < <= !=
+		bse.HavingParam += having[0].(string) + " " + having[1].(string) + "?)"
+		bse.WhereExec = append(bse.WhereExec, having[2])
+	}
+
+	return bse
+}
+
+func (bse *BigSmartEngine) Exec(sql string) (int64, error) {
+	result, err := bse.Db.Exec(sql)
+	if err != nil {
+		return 0, bse.setErrorInfo(err)
+	}
+
+	bse.Sql = sql
+
+	//insert
+	if strings.Contains(sql, "insert") {
+		lastInsertId, _ := result.LastInsertId()
+		return lastInsertId, nil
+	}
+	rows, _ := result.RowsAffected()
+	return rows, nil
+}
+
+func (bse *BigSmartEngine) Query(sql string) ([]map[string]string, error) {
+	result, err := bse.Db.Query(sql)
+	if err != nil {
+		return nil, bse.setErrorInfo(err)
+	}
+
+	bse.Sql = sql
+
+	column, err := result.Columns()
+	if err != nil {
+		return nil, bse.setErrorInfo(err)
+	}
+
+	values := make([][]byte, len(column))
+	scans := make([]interface{}, len(column))
+	for i := range values {
+		scans[i] = &values[i]
+	}
+
+	resultMap := make([]map[string]string, 0)
+	for result.Next() {
+		if err := result.Scan(scans...); err != nil {
+			return nil, bse.setErrorInfo(err)
+		}
+		row := make(map[string]string, len(column))
+		for k, v := range values {
+			row[column[k]] = string(v)
+		}
+		resultMap = append(resultMap, row)
+	}
+	return resultMap, nil
+}
+
+func (bse *BigSmartEngine) Begin() error {
+	if bse.TransStatus == 1 || bse.Tx != nil {
+		return errors.New("Transaction already exists")
+	}
+	bse.mu.Lock()
+	tx, err := bse.Db.Begin()
+	if err != nil {
+		return err
+	}
+	bse.TransStatus = 1
+	bse.Tx = tx
+	bse.mu.Unlock()
+	return nil
+}
+
+func (bse *BigSmartEngine) Rollback() error {
+	if bse.TransStatus != 1 || bse.Tx == nil {
+		return errors.New("Transaction not exists")
+	}
+	bse.mu.Lock()
+	err := bse.Tx.Rollback()
+	if err != nil {
+		return err
+	}
+	bse.TransStatus = 0
+	bse.mu.Unlock()
+	return nil
+}
+
+func (bse *BigSmartEngine) Commit() error {
+	if bse.TransStatus != 1 || bse.Tx == nil {
+		return errors.New("Transaction not exists")
+	}
+	bse.mu.Lock()
+	err := bse.Tx.Commit()
+	if err != nil {
+		return err
+	}
+	bse.TransStatus = 0
+	bse.Tx = nil
+	bse.mu.Unlock()
+	return nil
 }
